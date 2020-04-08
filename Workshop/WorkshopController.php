@@ -15,9 +15,11 @@ use Statamic\API\Fieldset;
 use Statamic\API\GlobalSet;
 use Statamic\API\Collection;
 use Statamic\Extend\Controller;
-use Stringy\StaticStringy as Stringy;
+use Illuminate\Support\MessageBag;
 use Illuminate\Http\RedirectResponse;
+use Stringy\StaticStringy as Stringy;
 use Statamic\CP\Publish\ValidationBuilder;
+use Statamic\Exceptions\SilentFormFailureException;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 
 class WorkshopController extends Controller
@@ -71,7 +73,7 @@ class WorkshopController extends Controller
      */
     public function init()
     {
-        if ( ! $this->isAllowed()) {
+        if (! $this->isAllowed()) {
             return redirect()->back();
         }
 
@@ -114,7 +116,7 @@ class WorkshopController extends Controller
     }
 
     /**
-     * Get the default fieldset for the content type
+     * Get the default fieldset for the content type.
      *
      * @param string $type
      * @return string
@@ -137,7 +139,7 @@ class WorkshopController extends Controller
      */
     public function postEntryCreate()
     {
-        if ( ! $this->meta['collection']) {
+        if (! $this->meta['collection']) {
             return back()->withInput()->withErrors(['A collection is required.'], 'workshop');
         }
 
@@ -147,14 +149,12 @@ class WorkshopController extends Controller
         $this->fieldset = ($this->meta['fieldset']) ? Fieldset::get($this->meta['fieldset']) : $collection->fieldset();
 
         $validator = $this->getValidator([
-            'fields.slug' => "entry_slug_exists:{$collection->path()}"
+            'fields.slug' => "entry_slug_exists:{$collection->path()}",
         ]);
 
         if ($validator->fails()) {
             return back()->withInput()->withErrors($validator, 'workshop');
         }
-
-        $this->uploadFiles();
 
         $factory = Entry::create($this->meta['slug'])
             ->collection($collection->path())
@@ -171,11 +171,25 @@ class WorkshopController extends Controller
 
         $this->content = $factory->get();
 
+        try {
+            // Allow addons to prevent the submission of the form, return
+            // their own errors, and modify the submission.
+            $errors = array_get($this->runCreatingEvent(), 'errors', []);
+        } catch (SilentFormFailureException $e) {
+            return $this->saveSuccess();
+        }
+
+        if ($errors) {
+            return $this->failure($errors);
+        }
+
+        $this->uploadFiles();
+
         return $this->save();
     }
 
     /**
-     * Upload files
+     * Upload files.
      *
      * @return void
      */
@@ -203,7 +217,7 @@ class WorkshopController extends Controller
     }
 
     /**
-     * Upload a single file
+     * Upload a single file.
      *
      * @param UploadedFile $file  The uploaded file
      * @param array $config       The field config
@@ -243,7 +257,7 @@ class WorkshopController extends Controller
             : $this->content->fieldset();
 
         return $this->update([
-            'fields.slug' => "entry_slug_exists:{$this->content->collectionName()},{$this->content->id()}"
+            'fields.slug' => "entry_slug_exists:{$this->content->collectionName()},{$this->content->id()}",
         ]);
     }
 
@@ -268,9 +282,8 @@ class WorkshopController extends Controller
             $this->meta['fieldset'] ?: $this->getDefaultFieldset('page')
         );
 
-
         $validator = $this->getValidator([
-            'fields.slug' => "page_uri_exists:{$this->meta['parent']}"
+            'fields.slug' => "page_uri_exists:{$this->meta['parent']}",
         ]);
 
         if ($validator->fails()) {
@@ -303,7 +316,7 @@ class WorkshopController extends Controller
             : $this->content->fieldset();
 
         return $this->update([
-            'fields.slug' => "page_uri_exists:{$this->meta['parent']},{$this->content->id()}"
+            'fields.slug' => "page_uri_exists:{$this->meta['parent']},{$this->content->id()}",
         ]);
     }
 
@@ -377,13 +390,13 @@ class WorkshopController extends Controller
 
         if ($this->meta['redirect']) {
             return redirect($this->getRedirect());
-        };
+        }
 
         return redirect()->back();
     }
 
     /**
-     * Get the Validator instance
+     * Get the Validator instance.
      *
      * @return mixed
      */
@@ -401,7 +414,7 @@ class WorkshopController extends Controller
         if ($this->meta['slugify']) {
             $sluggard = array_filter(explode('|', array_get($rules, "fields.{$this->meta['slugify']}")));
             $sluggard[] = 'required';
-            $rules["fields.{$this->meta['slugify']}"] = join('|', $sluggard);
+            $rules["fields.{$this->meta['slugify']}"] = implode('|', $sluggard);
         }
 
         $rules = array_merge($rules, $extraRules);
@@ -420,13 +433,7 @@ class WorkshopController extends Controller
 
         $this->content->save();
 
-        $this->flash->put('success', true);
-
-        if ($this->meta['redirect']) {
-            return redirect($this->getRedirect());
-        };
-
-        return redirect()->back();
+        return $this->saveSuccess();
     }
 
     /**
@@ -521,8 +528,71 @@ class WorkshopController extends Controller
     {
         if ($this->getConfig('enforce_auth') && ! \Auth::check()) {
             return false;
-        };
+        }
 
         return true;
+    }
+
+    private function saveSuccess()
+    {
+        $this->flash->put('success', true);
+
+        if ($this->meta['redirect']) {
+            return redirect($this->getRedirect());
+        }
+
+        return redirect()->back();
+    }
+
+    /**
+     * The steps for a failed form submission.
+     *
+     * @param array $params
+     * @param array $submission
+     * @param string $formset
+     * @return Response|RedirectResponse
+     */
+    private function failure($errors)
+    {
+        if (request()->ajax()) {
+            return response([
+                'errors' => (new MessageBag($errors))->all(),
+                'field_errors' => $errors,
+            ], 400);
+        }
+
+        // Set up where to be taken in the event of an error.
+        // if ($error_redirect = array_get($params, 'error_redirect')) {
+        //     $error_redirect = redirect($error_redirect);
+        // } else {
+        $error_redirect = back();
+        // }
+
+        return $error_redirect->withInput()->withErrors($errors, 'workshop');
+    }
+
+    private function runCreatingEvent()
+    {
+        $errors = [];
+
+        $responses = event('content.creating', $this->content);
+
+        foreach ($responses as $response) {
+            // Ignore any non-arrays
+            if (! is_array($response)) {
+                continue;
+            }
+
+            // If the event returned errors, tack those onto the array.
+            if ($response_errors = array_get($response, 'errors')) {
+                $errors = array_merge($response_errors, $errors);
+                continue;
+            }
+
+            // If the event returned data, we'll replace it with that.
+            $this->content = array_get($response, 'content');
+        }
+
+        return [$errors];
     }
 }
